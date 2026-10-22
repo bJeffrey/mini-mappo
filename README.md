@@ -1,36 +1,123 @@
+# mini-MAPPO
+
+A small, educational implementation of **Multi-Agent PPO (MAPPO)** using
+**Centralized Training, Decentralized Execution (CTDE)**.
+
+This fork is intentionally being reorganized in small steps so it can later be
+extended toward graph-attention MAPPO and temporal/belief-state memory without
+turning one large script into a harder-to-follow implementation.
+
 ## What is MAPPO?
-<b>MAPPO</b> adapts the popular PPO algorithm for multi-agent environments. It relies on a specific paradigm called Centralized Training, Decentralized Execution (CTDE).
 
-1) Decentralized Execution (The Actor): When the agents are actually playing (or "executing"), they only see their own local observations. They don't know what others see.
+1. **Decentralized execution (Actor):** each agent chooses an action using only
+   its local observation.
+2. **Centralized training (Critic):** during training, the critic may use a
+   global state to estimate value and provide a stronger learning signal.
 
-2) Centralized Training (The Critic): During training, we allow the "Critic" (the network that estimates how good a situation is) to see everything—the global state or the observations of all agents combined. This helps the agents learn cooperative strategies faster.
+The current demo shares one Actor across agents. The Critic receives the global
+state and returns one value estimate per agent.
 
-## Demo Video
+## Code map
+
+- `mini_mappo/config.py` — experiment and PPO hyperparameters.
+- `mini_mappo/environment.py` — GridWorld dynamics and the CTDE observation/state contract.
+- `mini_mappo/networks.py` — Actor and centralized Critic neural networks.
+- `mini_mappo/agent.py` — policy sampling, action evaluation, and model ownership.
+- `mini_mappo/rollout.py` — on-policy trajectory storage and GAE.
+- `mini_mappo/trainer.py` — rollout collection and PPO/MAPPO optimization.
+- `mini_mappo/visualization.py` — rendering only; no training logic.
+- `main.py` — thin executable entry point.
+- `tests/test_core.py` — small regression/smoke tests.
+
+This separation is deliberate. Future steps can add graph construction, node
+encoders, graph attention, and a temporal-memory module at clear boundaries.
+
+## Data flow
+
+```text
+local observations -> shared Actor -> actions -> environment
+                                          |
+global state --------------------------> Critic
+                                          |
+Actor/Critic outputs + rewards -> RolloutBuffer -> GAE -> PPO update
+```
+
+## Bugs corrected during the modularization pass
+
+The original single-file example was reviewed before refactoring. The following
+issues were corrected while preserving the small educational scope:
+
+- **Terminal-condition mismatch:** `GridWorldEnv.step()` ended an episode when
+  *any* agent reached the target, while the training loop waited for *all*
+  agents. Training now uses the environment's `done` signal consistently.
+- **GAE mixed agents with time:** agent samples were flattened before GAE, so an
+  agent at time `t` could be treated as the temporal predecessor of another
+  agent at the same time. Rollouts now retain `[time, agent]` structure and GAE
+  is computed independently along time for each agent.
+- **Terminal bootstrapping:** rollout masks were always `1`, including terminal
+  transitions. Terminal transitions now use a zero mask and do not bootstrap
+  from a value beyond the episode.
+- **Critic target ambiguity:** a scalar critic was trained against different
+  per-agent returns for the same global state. The critic now has one centralized
+  value head per agent.
+- **Unused minibatch setting:** PPO updates now actually use the configured
+  minibatch size.
+- **Coordinate normalization:** grid coordinates now divide by
+  `grid_size - 1`, mapping the full coordinate range to `[0, 1]`.
+
+## Rollout and GAE
+
+PPO is on-policy. `RolloutBuffer` records recent trajectories from the current
+policy and then discards them after the PPO update. It is **not** a DQN-style
+long-term replay buffer.
+
+GAE is computed as
+
+```text
+delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+A_t = delta_t + gamma * lambda * A_{t+1}
+return_t = A_t + V(s_t)
+```
+
+with terminal masking and a separate temporal sequence for each agent.
+
+## PPO update
+
+The update uses:
+
+- clipped policy-ratio objective,
+- fixed rollout advantages,
+- centralized critic value loss,
+- entropy regularization,
+- multiple epochs and shuffled minibatches.
+
+## Demo video
+
 [![IMAGE](image/frame.jpg)](https://youtu.be/Fn9okCSeA1Q)
 
+## Run
 
-## Architecture
-- Actor ($\pi_{\theta}$): Input is the local observation ($o_i$). Output is the action probability distribution.
-- Critic ($V_{\phi}$): Input is the global state ($s$). In this implementation, the global state is simply all agents' observations concatenated together. Output is a single value score.
+```bash
+pip install -r requirements.txt
+python main.py
+```
 
-## Data Collection (Rollout)
-- Observations
-- Global States (all obs combined)
-- Actions taken
-- Log probabilities of those actions
-- Rewards received
+Run the small regression suite with:
 
-## Advantage Estimation (GAE)
-We calculate how much "better" an action was compared to the average expectation. We use Generalized Advantage Estimation (GAE), which balances bias and variance to stabilize training.
+```bash
+python -m unittest discover -s tests
+```
 
-## The PPO Update
-We update the networks using the collected data.
+## Next learning steps
 
-- Clipping: Don't change the policy too drastically in one step. It clips the ratio between the new and old policy probabilities.
+The code is intentionally ready to grow in small increments. Natural next
+modules are:
 
-- Value Loss: We minimize the error between the Critic's prediction and the actual returns.
+1. graph construction,
+2. type-aware node encoders,
+3. graph attention,
+4. optional temporal memory / belief state,
+5. graph-aware actor and centralized critic inputs.
 
-- Entropy: We add a bonus for randomness to prevent the agent from getting stuck doing the same thing too early.
-  
-## Contributing
-Contributions are welcome. If you find a bug or have a feature request, please open an issue or submit a pull request.
+The baseline should remain runnable at each step so new complexity can be
+compared against the simpler MAPPO implementation.
