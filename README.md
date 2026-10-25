@@ -98,7 +98,29 @@ The update uses:
 ## Run
 
 ```bash
+## Only needed once
+
+# install
+sudo apt install -y python3-venv
+
+# Create a virtual environment in the repo
+python3 -m venv .venv
+
+## Needed every time
+
+# Activate the virtual environment
+source .venv/bin/activate
+
+# Upgrade pip (only once)
+python -m pip install --upgrade pip
+
+# prep requirements
 pip install -r requirements.txt
+
+# Install repository dependencies
+python -m pip install -r requirements.txt
+
+# finally - run
 python main.py
 ```
 
