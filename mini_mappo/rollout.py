@@ -37,12 +37,15 @@ class RolloutBuffer:
         done: bool,
     ) -> None:
         """Store one environment timestep for all agents."""
+        
+        # Snapshot array inputs so later environment updates cannot alter history.
         self.observations.append(np.asarray(observations, dtype=np.float32).copy())
         self.global_states.append(np.asarray(global_state, dtype=np.float32).copy())
         self.actions.append(np.asarray(actions, dtype=np.int64))
         self.log_probs.append(np.asarray(log_probs, dtype=np.float32))
         self.rewards.append(np.asarray(rewards, dtype=np.float32).copy())
         self.values.append(np.asarray(values, dtype=np.float32).copy())
+        # A terminal transition must not inherit value from the next state.
         self.masks.append(0.0 if done else 1.0)
 
     def compute_gae(self, last_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -55,6 +58,8 @@ class RolloutBuffer:
         """
         rewards = np.asarray(self.rewards, dtype=np.float32)  # [T, N]
         values = np.asarray(self.values, dtype=np.float32)    # [T, N]
+        
+        # Broadcast each timestep's terminal mask across its agents.
         masks = np.asarray(self.masks, dtype=np.float32)[:, None]  # [T, 1]
         last_values = np.asarray(last_values, dtype=np.float32)
 
@@ -62,12 +67,14 @@ class RolloutBuffer:
         gae = np.zeros(self.config.num_agents, dtype=np.float32)
         next_values = last_values
 
+        # Accumulate discounted TD residuals backward, separately for each agent.
         for t in reversed(range(len(rewards))):
             delta = rewards[t] + self.config.gamma * next_values * masks[t] - values[t]
             gae = delta + self.config.gamma * self.config.gae_lambda * masks[t] * gae
             advantages[t] = gae
             next_values = values[t]
 
+        # Add the baseline back to produce critic regression targets.
         returns = advantages + values
         return advantages, returns
 
@@ -75,18 +82,24 @@ class RolloutBuffer:
         self, advantages: np.ndarray, returns: np.ndarray
     ) -> dict[str, np.ndarray]:
         """Convert [time, agent, ...] rollout data into PPO sample rows."""
+        
         observations = np.asarray(self.observations, dtype=np.float32)  # [T,N,O]
         states = np.asarray(self.global_states, dtype=np.float32)       # [T,S]
         actions = np.asarray(self.actions, dtype=np.int64)              # [T,N]
         log_probs = np.asarray(self.log_probs, dtype=np.float32)        # [T,N]
 
         time_steps = observations.shape[0]
+        
+        # Attach the same global state to every agent row at a given timestep.
         repeated_states = np.repeat(states[:, None, :], self.config.num_agents, axis=1)
+        
+        # Preserve which critic head belongs to each row after flattening.
         agent_ids = np.broadcast_to(
             np.arange(self.config.num_agents, dtype=np.int64),
             (time_steps, self.config.num_agents),
         )
 
+        # Flatten in time-major order consistently across inputs and targets.
         return {
             "obs": observations.reshape(-1, self.config.obs_dim),
             "state": repeated_states.reshape(-1, self.config.global_state_dim),

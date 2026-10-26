@@ -14,9 +14,12 @@ from .rollout import RolloutBuffer
 
 def ppo_update(agent: MAPPOAgent, batch: dict[str, np.ndarray]) -> dict[str, float]:
     """Run clipped PPO updates over one on-policy trajectory batch."""
+    
     cfg = agent.config
     device = agent.device
 
+    # as_tensor converts NumPy arrays to PyTorch tensors on the CPU or GPU.
+    # float32 holds continuous data; long holds 64-bit action and agent indices.
     obs = torch.as_tensor(batch["obs"], dtype=torch.float32, device=device)
     states = torch.as_tensor(batch["state"], dtype=torch.float32, device=device)
     agent_ids = torch.as_tensor(batch["agent_id"], dtype=torch.long, device=device)
@@ -27,6 +30,8 @@ def ppo_update(agent: MAPPOAgent, batch: dict[str, np.ndarray]) -> dict[str, flo
 
     # GAE advantages are fixed rollout targets. Normalize once rather than
     # recomputing them from the changing critic during every PPO epoch.
+    # mean() averages all entries; std(unbiased=False) uses population standard
+    # deviation, which remains defined even for one sample.
     advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
     sample_count = obs.shape[0]
@@ -34,32 +39,54 @@ def ppo_update(agent: MAPPOAgent, batch: dict[str, np.ndarray]) -> dict[str, flo
     last_critic_loss = 0.0
 
     for _ in range(cfg.update_epochs):
+        # randperm returns each row index exactly once in random order. Indexing
+        # every field with the same indices keeps shuffled samples aligned.
         permutation = torch.randperm(sample_count, device=device)
 
         for start in range(0, sample_count, cfg.minibatch_size):
             idx = permutation[start : start + cfg.minibatch_size]
 
+            # Compare the current policy with the policy that collected each action.
             new_log_probs, entropy = agent.evaluate_actions(obs[idx], actions[idx])
+            # exp applies e**x element by element, converting the difference of
+            # log probabilities into the new/old action probability ratio.
             ratio = torch.exp(new_log_probs - old_log_probs[idx])
 
+            # Clip the surrogate objective to limit incentives for large policy changes.
             unclipped = ratio * advantages[idx]
+            # clamp bounds each ratio between the supplied minimum and maximum.
             clipped = torch.clamp(
                 ratio, 1.0 - cfg.clip_epsilon, 1.0 + cfg.clip_epsilon
             ) * advantages[idx]
+            
+            # min chooses the smaller objective per sample; mean averages across
+            # the minibatch. Negation turns the objective into a loss to minimize.
             actor_loss = -torch.min(unclipped, clipped).mean() - cfg.entropy_coef * entropy.mean()
 
+            # Each row belongs to one agent; select its value head from the
+            # centralized critic before comparing with that agent's return.
             all_values = agent.critic(states[idx])
+            
+            # unsqueeze makes indices [batch, 1]; gather selects that agent's
+            # column in each row; squeeze removes the size-one column dimension.
             selected_values = all_values.gather(1, agent_ids[idx].unsqueeze(1)).squeeze(1)
+            
+            # mse_loss averages squared prediction errors against the return targets.
             critic_loss = cfg.value_coef * F.mse_loss(selected_values, returns[idx])
 
+            # zero_grad clears previous derivatives, which PyTorch otherwise
+            # accumulates. backward computes loss derivatives for each weight;
+            # step asks Adam to update the weights using those derivatives.
             agent.actor_optimizer.zero_grad()
             actor_loss.backward()
             agent.actor_optimizer.step()
 
+            # Apply the same gradient/update sequence to the separate value network.
             agent.critic_optimizer.zero_grad()
             critic_loss.backward()
             agent.critic_optimizer.step()
 
+            # item extracts a scalar tensor as a Python number for reporting.
             last_actor_loss = float(actor_loss.item())
             last_critic_loss = float(critic_loss.item())
 
@@ -70,7 +97,10 @@ def collect_episode(
     env: GridWorldEnv, agent: MAPPOAgent
 ) -> tuple[RolloutBuffer, float, bool, np.ndarray]:
     """Collect one on-policy episode and return its rollout."""
+    
     cfg = agent.config
+    
+    # Start a fresh trajectory with matching local observations and global state.
     obs, state = env.reset()
     buffer = RolloutBuffer(cfg)
     episode_reward = 0.0
@@ -81,14 +111,18 @@ def collect_episode(
         log_probs: list[float] = []
 
         for i in range(cfg.num_agents):
+            # All agents share policy weights but act from their own observations.
             action, log_prob = agent.select_action(obs[i])
             actions.append(action)
             log_probs.append(log_prob)
 
         # The centralized critic evaluates the pre-action global state.
         values = agent.values(state)
+        
+        # Apply the joint action to obtain rewards and the next observations.
         next_obs, next_state, rewards, done = env.step(actions)
 
+        # Pair pre-action inputs with their resulting rewards and terminal flag.
         buffer.add(obs, state, actions, log_probs, rewards, values, done)
         episode_reward += float(np.sum(rewards))
 
@@ -110,6 +144,8 @@ def train(config: Config | None = None) -> MAPPOAgent:
     reward_history: list[float] = []
 
     for episode in range(1, cfg.total_episodes + 1):
+        
+        # Collect with the current policy before any optimizer steps change it.
         buffer, episode_reward, done, final_state = collect_episode(env, agent)
 
         # Do not bootstrap beyond a terminal state. If max_steps truncated the
@@ -119,8 +155,12 @@ def train(config: Config | None = None) -> MAPPOAgent:
             if done
             else agent.values(final_state)
         )
+        
+        # Compute temporal targets before flattening time and agent dimensions.
         advantages, returns = buffer.compute_gae(last_values)
         batch = buffer.flatten_for_training(advantages, returns)
+        
+        # Reuse this on-policy batch for the configured PPO epochs, then discard it.
         ppo_update(agent, batch)
 
         reward_history.append(episode_reward)

@@ -13,9 +13,11 @@ from mini_mappo.visualization import visualize_episodes
 
 def main() -> None:
     config = Config()
+    # Learn the shared policy before using it in fresh demonstration episodes.
     trained_agent = train(config)
 
     print("\nStarting real-time visualization...")
+    # Reuse the training configuration so rendering and policy dimensions agree.
     visualize_episodes(
         GridWorldEnv(config),
         trained_agent,
