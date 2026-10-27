@@ -28,10 +28,11 @@ def ppo_update(agent: MAPPOAgent, batch: dict[str, np.ndarray]) -> dict[str, flo
     advantages = torch.as_tensor(batch["advantage"], dtype=torch.float32, device=device)
     returns = torch.as_tensor(batch["return"], dtype=torch.float32, device=device)
 
-    # GAE advantages are fixed rollout targets. Normalize once rather than
-    # recomputing them from the changing critic during every PPO epoch.
+    # Generalized Advantage Estimation (GAE) advantages are fixed rollout targets.
+    # Normalize once rather than recomputing them from the changing critic during every PPO epoch.
     # mean() averages all entries; std(unbiased=False) uses population standard
     # deviation, which remains defined even for one sample.
+    # add small constant in denominator for numerical stability
     advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
     sample_count = obs.shape[0]
